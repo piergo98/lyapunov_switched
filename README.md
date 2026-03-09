@@ -43,7 +43,3 @@ Notes
 
 License
 - No license provided. Add a `LICENSE` file if you want to specify reuse terms.
-
-If you want, I can:
-- Add a `requirements.txt` or `pyproject.toml`.
-- Add example command-line arguments to select initial conditions or plotting options.
