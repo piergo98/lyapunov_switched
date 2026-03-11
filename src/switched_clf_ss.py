@@ -22,33 +22,24 @@ def create_simple_switched_system():
     lam = 4
     # Mode 1: Stable dynamics
     A1 = np.array([
-        # [0.0, 1.0],
-        # [-a+lam, b]
-        [-1.9, 2.0],
-        [-2.0, -0.8]
-    ])
-    B1 = np.array([
-        [1.0],
-        [0.5]
+        [0.0, 1.0],
+        [-a+lam, b]
+        # [-1.9, 2.0],
+        # [-2.0, -0.8]
     ])
     
     # Mode 2: Different dynamics
     A2 = np.array([
-        # [0.0, 1.0],
-        # [-a-lam, b]
+        [0.0, 1.0],
+        [-a-lam, b]
         # [-2.3, -0.2],
         # [0.0, -2.8]
-        [-1.9, 2.0],
-        [-2.0, -0.8]
-    ])
-    B2 = np.array([
-        [0.5],
-        [1.0]
+        # [-1.9, 2.0],
+        # [-2.0, -0.8]
     ])
     
     model = {
         'A': [A1, A2],
-        'B': [B1, B2]
     }
     
     return model
@@ -59,12 +50,10 @@ def instantiate_switched_sequence(model, n_phases, m=1):
     For simplicity, we can alternate between the two modes every m phases
     """
     A_seq = []
-    B_seq = []
     for i in range(n_phases):
         mode_idx = (i // m) % 2  # alternate every m phases
         A_seq.append(model['A'][mode_idx])
-        B_seq.append(model['B'][mode_idx])
-    return A_seq, B_seq
+    return A_seq
 
 def build_integrator(f):
     """Build RK4 integrator for dynamics.
@@ -124,7 +113,7 @@ delta = ca.MX.sym('delta', N)
 Q = ca.diag([1.0, 1.0])
 switched_model = create_simple_switched_system()
 m = 4  # phases per mode (must match the value in instantiate_switched_sequence)
-As, _ = instantiate_switched_sequence(switched_model, N, m)
+As = instantiate_switched_sequence(switched_model, N, m)
 xr = ca.DM([0.0, 0.0])  # reference state
 ur = ca.DM([0.0])       # reference control input
 l = (x - xr).T @ Q @ (x - xr)
@@ -150,7 +139,7 @@ ubg = []    # upper bounds on constraints
 delta_sum = 0  # to accumulate total time
 
 x0 = [2.0, -1.0]  # initial state
-alpha = 0.5  # CLF decay rate
+alpha = 0.3  # CLF decay rate
 
 # Include time duration variables in the decision variables
 Delta = ca.MX.sym('Delta', N)
@@ -169,33 +158,35 @@ Xk = ca.DM(x0)
 # Define a Lyapunov matrix for each subsystem (mode) as a decision variable
 P_lyap = []
 for i in range(NM):  # One P matrix per mode
-    Lk = ca.MX.sym('L' + str(i), NX, NX)
-    w += [ca.vec(Lk)]
+    Pk = ca.MX.sym('P' + str(i), NX, NX)
+    w += [ca.vec(Pk)]
     lbw += [-1e3] * NX * NX  # Assuming positive definite matrix
     ubw += [1e3] * NX * NX  # Upper bound for Lyapunov matrix elements
-    w0 += [1.0] * NX * NX  # Initial guess for Lyapunov matrix
-
-    # Enforce lower triangular structure
-    Lk_lower = ca.tril(Lk)
-
-    # Construct P
-    Pk = Lk_lower @ Lk_lower.T  # Automatically positive semi-definite
-
-    # To ensure strict positive definiteness, add small regularization to diagonal
-    eps = 1e-6
-    Pk = Lk_lower @ Lk_lower.T + eps * ca.MX.eye(NX)
+    w0 += list(np.eye(NX).flatten())  # Initial guess: identity matrix
     P_lyap.append(Pk)
+    
+    # Enforce positive definiteness of P_k
+    m_p = 1e-3  # Small margin for positive definiteness
+    M_p = 1e3   # Large upper bound for P_k
+    condition_1 = Pk - m_p * np.eye(NX)  # P_k - m*I >= 0
+    condition_2 = M_p * np.eye(NX) - Pk  # M*I - P_k >= 0
+    g += [ca.reshape(condition_1, -1, 1)]
+    lbg += [0.0] * (NX * NX)
+    ubg += [1e3] * (NX * NX)
+    g += [ca.reshape(condition_2, -1, 1)]
+    lbg += [0.0] * (NX * NX)
+    ubg += [1e3] * (NX * NX)
     
 # We'll add continuity constraints at switching points within the trajectory loop
 # (removed the constraint that forces P_0 = P_1)
     
 for k in range(N):
     # Determine mode index for current phase
-    idx = (k // m) % NM
+    idx = int((k // m) % NM)
     
     # Check if this is a switching point (mode changes from previous phase)
     if k > 0:
-        idx_prev = ((k-1) // m) % NM
+        idx_prev = int(((k-1) // m) % NM)
         if idx != idx_prev:
             # Enforce V continuity at switching point: x^T P_prev x = x^T P_curr x
             # => x^T (P_prev - P_curr) x = 0
@@ -212,7 +203,8 @@ for k in range(N):
     Xk_end, _ = f_dyn_list[k](Xk, Delta[k])
     
     Vk_end = Xk_end.T @ Pk @ Xk_end  # Use same P_k for consistency
-    g += [ca.reshape(Vk_end - Vk + alpha * Vk, -1, 1)]  # Ensure column vector
+    # CLF constraint: V(x_{k+1}) - V(x_k) <= -alpha * V(x_k)
+    g += [ca.reshape(Vk_end - Vk + alpha * 1, -1, 1)]  # Ensure column vector (scalar)
     lbg += [-1e3]  # Lower bound (can be adjusted)
     ubg += [0.0]   # Upper bound (constraint is <= 0)
     
@@ -276,10 +268,8 @@ Delta_opt = w_opt[:N]
 P_opt = []
 idx = N
 for i in range(NM):
-    L_vec = w_opt[idx:idx + NX*NX]
-    L = L_vec.reshape(NX, NX)
-    L_lower = np.tril(L)
-    P = L_lower @ L_lower.T + 1e-6 * np.eye(NX)
+    P_vec = w_opt[idx:idx + NX*NX]
+    P = P_vec.reshape(NX, NX)
     P_opt.append(P)
     idx += NX*NX
 
