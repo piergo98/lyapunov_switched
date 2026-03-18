@@ -95,6 +95,7 @@ NU = 1      # control dimension
 N = 100      # horizon length
 T = 3.0     # total time horizon
 NM = 2  # number of subsystems (modes)
+m = 4  # phases per mode (must match the value in instantiate_switched_sequence)
 
 x_bound = 5.0
 
@@ -112,7 +113,7 @@ x = ca.MX.sym('x', NX)
 delta = ca.MX.sym('delta', N)
 Q = ca.diag([1.0, 1.0])
 switched_model = create_simple_switched_system()
-m = 4  # phases per mode (must match the value in instantiate_switched_sequence)
+
 As = instantiate_switched_sequence(switched_model, N, m)
 xr = ca.DM([0.0, 0.0])  # reference state
 ur = ca.DM([0.0])       # reference control input
@@ -139,7 +140,7 @@ ubg = []    # upper bounds on constraints
 delta_sum = 0  # to accumulate total time
 
 x0 = [2.0, -1.0]  # initial state
-alpha = 0.3  # CLF decay rate
+alpha = 0.003  # CLF decay rate
 
 # Include time duration variables in the decision variables
 Delta = ca.MX.sym('Delta', N)
@@ -155,27 +156,29 @@ Xk = ca.DM(x0)
 # a) At switching points: V_prev(x_switch) = V_curr(x_switch) for continuity
 # b) Within each mode: V(x_k+1) - V(x_k) <= -alpha * V(x_k) for stability
 
-# Define a Lyapunov matrix for each subsystem (mode) as a decision variable
+# Define a Lyapunov matrix for each subsystem (mode) as a decision variable.
+# Parametrize P = L @ L.T to guarantee positive definiteness by construction,
+# avoiding element-wise P.d. constraints that cause LICQ violations.
+# L is lower-triangular: [l0, 0; l1, l2] with l0, l2 > 0 (diagonal > 0).
+# Decision variables are [l0, l1, l2] for each mode (3 vars per mode).
 P_lyap = []
-for i in range(NM):  # One P matrix per mode
-    Pk = ca.MX.sym('P' + str(i), NX, NX)
-    w += [ca.vec(Pk)]
-    lbw += [-1e3] * NX * NX  # Assuming positive definite matrix
-    ubw += [1e3] * NX * NX  # Upper bound for Lyapunov matrix elements
-    w0 += list(np.eye(NX).flatten())  # Initial guess: identity matrix
+L_chol = []  # keep L for initial guess reconstruction
+m_p = 1e-3   # minimum value for diagonal entries of L
+M_p = 1e2    # maximum value for entries of L
+for i in range(NM):
+    # Lower-triangular Cholesky factor L (NX=2 → 3 free parameters)
+    Lk = ca.MX.sym('L' + str(i), NX, NX)
+    # Only the lower-triangular part is used; upper-triangular will be zeroed via bounds
+    # vec(Lk) = [L00, L10, L01, L11]  (column-major)
+    w += [ca.vec(Lk)]
+    # L00 > 0, L10 free, L01 = 0, L11 > 0
+    lbw += [m_p,  -M_p,  0.0,  m_p]   # [L00, L10, L01, L11]
+    ubw += [M_p,   M_p,  0.0,  M_p]
+    w0  += [1.0,   0.0,  0.0,  1.0]   # identity initial guess
+    L_chol.append(Lk)
+    # P = L @ L.T  (symmetric positive definite by construction, no extra constraints)
+    Pk = Lk @ Lk.T
     P_lyap.append(Pk)
-    
-    # Enforce positive definiteness of P_k
-    m_p = 1e-3  # Small margin for positive definiteness
-    M_p = 1e3   # Large upper bound for P_k
-    condition_1 = Pk - m_p * np.eye(NX)  # P_k - m*I >= 0
-    condition_2 = M_p * np.eye(NX) - Pk  # M*I - P_k >= 0
-    g += [ca.reshape(condition_1, -1, 1)]
-    lbg += [0.0] * (NX * NX)
-    ubg += [1e3] * (NX * NX)
-    g += [ca.reshape(condition_2, -1, 1)]
-    lbg += [0.0] * (NX * NX)
-    ubg += [1e3] * (NX * NX)
     
 # We'll add continuity constraints at switching points within the trajectory loop
 # (removed the constraint that forces P_0 = P_1)
@@ -204,7 +207,9 @@ for k in range(N):
     
     Vk_end = Xk_end.T @ Pk @ Xk_end  # Use same P_k for consistency
     # CLF constraint: V(x_{k+1}) - V(x_k) <= -alpha * V(x_k)
-    g += [ca.reshape(Vk_end - Vk + alpha * 1, -1, 1)]  # Ensure column vector (scalar)
+    #g += [ca.reshape(Vk_end - Vk + alpha * Vk, -1, 1)]  # Ensure column vector (scalar)
+    ###### TRIAL:
+    g += [ca.reshape(Vk_end - Vk + alpha * Vk, -1, 1)]  # Ensure column vector (scalar)
     lbg += [-1e3]  # Lower bound (can be adjusted)
     ubg += [0.0]   # Upper bound (constraint is <= 0)
     
@@ -240,16 +245,19 @@ print(f"Number of decision variables: {decision_variables_num}")
 print(f"Number of constraints: {constraints_num}")
 
 # Create the NLP solver
+HSL_LIB = os.path.expanduser(
+    "~/ThirdParty-HSL/install/lib/x86_64-linux-gnu/libcoinhsl.so"
+)
 opts = {
-    "expand": True, 
+    "expand": True,
     "ipopt": {
-        "print_level": 5, 
-        "max_iter": 5000, 
-        "tol": 1e-6, 
-        "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
-        "linear_solver": "ma27",
+        "print_level": 5,
+        "max_iter": 5000,
+        "tol": 1e-6,
+        # Use MA27 if the HSL library is present, otherwise fall back to MUMPS
+        **({"hsllib": HSL_LIB, "linear_solver": "ma27"} if os.path.exists(HSL_LIB) else {"linear_solver": "mumps"}),
         # "mu_strategy": "adaptive",
-    }
+    },
 }
 solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
 
@@ -268,8 +276,9 @@ Delta_opt = w_opt[:N]
 P_opt = []
 idx = N
 for i in range(NM):
-    P_vec = w_opt[idx:idx + NX*NX]
-    P = P_vec.reshape(NX, NX)
+    L_vec = w_opt[idx:idx + NX*NX]
+    L = L_vec.reshape(NX, NX)   # column-major: L is lower-triangular
+    P = L @ L.T                  # recover P = L L^T
     P_opt.append(P)
     idx += NX*NX
 
@@ -376,9 +385,9 @@ plt.plot(cumulative_time_nodes, V_values, 'purple', linewidth=2.5, marker='o', m
 # Also plot state norm for comparison
 state_norms = np.linalg.norm(X_nodes, axis=0)
 plt.plot(cumulative_time_nodes, state_norms**2, 'g--', linewidth=2, marker='s', markersize=5, alpha=0.7, label='||x||²')
-# Plot expected decay envelope
-V_expected = V_values[0] * np.exp(-alpha * cumulative_time_nodes)
-plt.plot(cumulative_time_nodes, V_expected, 'r:', linewidth=2, label=f'V₀·e^(-α·t)', alpha=0.7)
+# Plot analytical decay trajectory from dV/dt = -alpha*V
+V_expected_decay = V_values[0] * np.exp(-alpha * cumulative_time_nodes)
+plt.plot(cumulative_time_nodes, V_expected_decay, 'r:', linewidth=2, label='V₀·e^(-α·t)', alpha=0.8)
 plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
 plt.title('Lyapunov Function Evolution', fontweight='bold')
 plt.xlabel('Time (s)')
